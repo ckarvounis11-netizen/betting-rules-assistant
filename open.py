@@ -1,180 +1,116 @@
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 import pdfplumber
 import streamlit as st
 import os
 
-
 # =========================================================
-# 1. OPENAI API KEY
+# 1. SETTINGS
 # =========================================================
 
 MY_OPENAI_KEY = st.secrets["OPENAI_API_KEY"]
 
+PDF_FILE = "combined_rules.pdf"   # must be in the same folder as this file
 
-# =========================================================
-# 2. STREAMLIT PAGE
-# =========================================================
+# First PDF page of each company's section
+COMPANIES = [
+    ("DLS", 1),
+    ("CATSR", 21),
+    ("BCLC", 49),
+    ("LQ", 129),
+    ("TOTO", 159),
+    ("WSB", 189),
+]
 
-st.set_page_config(
-    page_title="Betting Rules Assistant",
-    page_icon="📚"
-)
+COMPANY_NAMES = {
+    "DLS": "Danske Licens Spil",
+    "CATSR": "Casino Arizona & Talking Stick Resort",
+    "BCLC": "BCLC / PlayNow",
+    "LQ": "Loto-Quebec / Mise-o-jeu+",
+    "TOTO": "TOTO Online B.V.",
+    "WSB": "World Sports Betting",
+}
 
+st.set_page_config(page_title="Betting Rules Assistant", page_icon="📚")
 st.header("Betting Rules Assistant")
 
 
+def company_of(page_number):
+    name = COMPANIES[0][0]
+    for code, start in COMPANIES:
+        if page_number >= start:
+            name = code
+    return name
+
+
 # =========================================================
-# 3. DOCUMENTS FOLDER
+# 2. LOAD PDF -> one Document per chunk, with company + page
 # =========================================================
 
-DOCUMENTS_FOLDER = "documents"
+@st.cache_resource(show_spinner="Reading the rules document...")
+def load_chunks():
+    if not os.path.exists(PDF_FILE):
+        return None, f"File '{PDF_FILE}' was not found in the repository."
 
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ". ", " ", ""],
+        chunk_size=1500,
+        chunk_overlap=250,
+    )
 
-# =========================================================
-# 4. READ ALL PDF FILES
-# =========================================================
-
-@st.cache_data
-def load_documents():
-
-    if not os.path.exists(DOCUMENTS_FOLDER):
-        return None, "The documents folder was not found."
-
-    pdf_files = [
-        file_name
-        for file_name in os.listdir(DOCUMENTS_FOLDER)
-        if file_name.lower().endswith(".pdf")
-    ]
-
-    if not pdf_files:
-        return None, "No PDF documents were found in the documents folder."
-
-    documents_text = ""
-
-    for pdf_file in pdf_files:
-
-        pdf_path = os.path.join(
-            DOCUMENTS_FOLDER,
-            pdf_file
-        )
-
-        with pdfplumber.open(pdf_path) as pdf:
-
-            for page_number, page in enumerate(
-                pdf.pages,
-                start=1
-            ):
-
-                page_text = page.extract_text() or ""
-
-                documents_text += (
-                    f"\n\n"
-                    f"--- SOURCE: {pdf_file} | PAGE: {page_number} ---\n\n"
-                    f"{page_text}"
+    chunks = []
+    with pdfplumber.open(PDF_FILE) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            text = (page.extract_text() or "").replace("\t", " ").strip()
+            if not text:
+                continue
+            company = company_of(page_number)
+            for piece in splitter.split_text(text):
+                chunks.append(
+                    Document(
+                        # company name is inside the text too, so searches
+                        # like "BCLC tennis retirement" match better
+                        page_content=f"[{company}] {piece}",
+                        metadata={"company": company, "page": page_number},
+                    )
                 )
-
-    return documents_text, None
-
-
-documents_text, error_message = load_documents()
+    return chunks, None
 
 
+chunks, error_message = load_chunks()
 if error_message:
     st.error(error_message)
     st.stop()
 
 
 # =========================================================
-# 5. SPLIT TEXT INTO CHUNKS
+# 3. EMBEDDINGS + FAISS
 # =========================================================
 
-@st.cache_data
-def create_chunks(documents_text):
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", ".", ",", " ", ""],
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-
-    return text_splitter.split_text(documents_text)
-
-
-chunks = create_chunks(documents_text)
-
-
-# =========================================================
-# 6. GENERATE EMBEDDINGS
-# =========================================================
-
-@st.cache_resource
-def create_embeddings():
-
-    return OpenAIEmbeddings(
+@st.cache_resource(show_spinner="Building the search index (first run only)...")
+def create_vector_store():
+    embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
-        openai_api_key=MY_OPENAI_KEY
+        openai_api_key=MY_OPENAI_KEY,
     )
+    return FAISS.from_documents(chunks, embeddings)
 
 
-embeddings = create_embeddings()
+vector_store = create_vector_store()
 
-
-# =========================================================
-# 7. CREATE FAISS DATABASE
-# =========================================================
-
-@st.cache_resource
-def create_vector_store(chunks):
-
-    return FAISS.from_texts(
-        chunks,
-        embeddings
-    )
-
-
-vector_store = create_vector_store(chunks)
-
-
-# =========================================================
-# 8. RETRIEVER
-# =========================================================
-
-retriever = vector_store.as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": 3}
-)
-
-
-# =========================================================
-# 9. FORMAT DOCUMENTS
-# =========================================================
-
-def format_docs(docs):
-
-    return "\n\n".join(
-        doc.page_content
-        for doc in docs
-    )
-
-
-# =========================================================
-# 10. OPENAI MODEL
-# =========================================================
 
 @st.cache_resource
 def create_llm():
-
     return ChatOpenAI(
         model="gpt-4o-mini",
-        temperature=0.2,
-        max_tokens=1000,
-        openai_api_key=MY_OPENAI_KEY
+        temperature=0.1,
+        max_tokens=1200,
+        openai_api_key=MY_OPENAI_KEY,
     )
 
 
@@ -182,89 +118,79 @@ llm = create_llm()
 
 
 # =========================================================
-# 11. PROMPT
+# 4. PROMPT
 # =========================================================
 
 prompt = ChatPromptTemplate.from_messages([
-
     (
         "system",
-
-        "You are an internal Betting Rules Assistant.\n\n"
-
-        "Your job is to answer questions strictly based "
-        "on the betting rules contained in the provided documents.\n\n"
-
-        "IMPORTANT RULES:\n"
-
-        "1. Use ONLY information contained in the provided documents.\n"
-
-        "2. Do NOT use outside knowledge.\n"
-
-        "3. Do NOT make assumptions.\n"
-
-        "4. Do NOT invent or guess a rule.\n"
-
-        "5. If the documents do not contain enough information "
-        "to answer the question, clearly state that there is "
-        "not enough information in the available rules.\n"
-
-        "6. When answering a question about voiding, settlement "
-        "or grading a bet, explain the rule that supports your answer.\n"
-
-        "7. Always mention the source document and page when "
-        "this information is available.\n\n"
-
-        "Give the answer clearly and professionally.\n\n"
-
-        "CONTEXT:\n"
-        "{context}"
+        "You are an internal Betting Rules Assistant. Answer strictly from "
+        "the rule excerpts below. Each excerpt is labelled with its company "
+        "code and PDF page.\n\n"
+        "Company codes: DLS = Danske Licens Spil; CATSR = Casino Arizona & "
+        "Talking Stick Resort; BCLC = BCLC/PlayNow; LQ = Loto-Quebec "
+        "(Mise-o-jeu+); TOTO = TOTO Online B.V.; WSB = World Sports Betting.\n\n"
+        "RULES:\n"
+        "1. Use ONLY the excerpts. No outside knowledge, no guessing.\n"
+        "2. Rules differ between companies. Always say which company's rule "
+        "you are quoting. If the question names no company and the "
+        "excerpts show different rules for different companies, list each "
+        "company's rule separately.\n"
+        "3. If the excerpts do not contain the answer, say clearly that "
+        "there is not enough information in the available rules. Do not "
+        "fill the gap.\n"
+        "4. For voiding / settlement / grading questions, explain the rule "
+        "that supports the answer.\n"
+        "5. Finish with the sources, in the form: Company - page N.\n"
+        "6. Reply in the same language as the question.\n\n"
+        "EXCERPTS:\n{context}",
     ),
-
-    (
-        "human",
-        "{question}"
-    )
-
+    ("human", "{question}"),
 ])
 
 
+def format_docs(docs):
+    return "\n\n".join(
+        f"[{d.metadata['company']} | page {d.metadata['page']}]\n{d.page_content}"
+        for d in docs
+    )
+
+
 # =========================================================
-# 12. CREATE RAG CHAIN
+# 5. UI
 # =========================================================
 
-chain = (
-
-    {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough()
-    }
-
-    | prompt
-    | llm
-    | StrOutputParser()
+options = ["All companies"] + [code for code, _ in COMPANIES]
+choice = st.selectbox(
+    "Company",
+    options,
+    format_func=lambda c: c if c == "All companies" else f"{c} - {COMPANY_NAMES[c]}",
 )
 
-
-# =========================================================
-# 13. USER QUESTION
-# =========================================================
-
-user_question = st.text_input(
-    "Ask a question about the betting rules:"
-)
-
-
-# =========================================================
-# 14. GENERATE ANSWER
-# =========================================================
+user_question = st.text_input("Ask a question about the betting rules:")
 
 if user_question:
-
     with st.spinner("Searching the betting rules..."):
+        if choice == "All companies":
+            # one lookup per company, so every company is represented
+            docs = []
+            for code, _ in COMPANIES:
+                docs += vector_store.max_marginal_relevance_search(
+                    user_question, k=3, fetch_k=40, filter={"company": code}
+                )
+        else:
+            docs = vector_store.max_marginal_relevance_search(
+                user_question, k=8, fetch_k=60, filter={"company": choice}
+            )
 
-        response = chain.invoke(user_question)
+        answer = (prompt | llm | StrOutputParser()).invoke(
+            {"context": format_docs(docs), "question": user_question}
+        )
 
     st.subheader("Answer")
+    st.write(answer)
 
-    st.write(response)
+    with st.expander("Excerpts used"):
+        for d in docs:
+            st.markdown(f"**{d.metadata['company']} - page {d.metadata['page']}**")
+            st.caption(d.page_content[:400] + "...")
